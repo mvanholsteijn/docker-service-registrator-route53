@@ -1,21 +1,3 @@
-"""
-manages the SRV records for Docker containers running on a specific host.
-When a container is start, the registrator will create a SRV record for each
-exposed port which has a matching SERVICE_<exposed-port>_NAME environment
-variable. If the container exposes a single port, it suffices to have a SERVICE_NAME
-environment variable.
-
-The registrator will create SRV records in Route53 with `<hostname>:<container-id>`
-as set identifier. This allows the registrator to synchronise SRV records with
-the current state of the running instances on the host. 
-
-The registrator has three commands: 'remove_all', 'sync' and 'run'.
-    
-    remove_all  - remove all service records point to this host
-    sync        - synchronise the service records with the running containers
-    run         - continuously update the SRV records by subscribing to the Docker event stream
-
-"""
 import sys
 import json
 import logging
@@ -32,7 +14,23 @@ log.setLevel('INFO')
 
 class ECSServiceRegistrator:
     """
-    manages SRV record registrations in Route53 for docker containers
+    manages the SRV record registration in Route53 for Docker containers running on this host.
+
+    When a container is start, the registrator will create a SRV record for each
+    exposed port which has a matching SERVICE_<exposed-port>_NAME environment
+    variable. If the container exposes a single port, it suffices to have a SERVICE_NAME
+    environment variable.
+
+    The registrator will create SRV records in Route53 with '<hostname>:<container-id>'
+    as set identifier. This allows the registrator to synchronise SRV records with
+    the current state of the running instances on the host. 
+
+    The registrator has three commands: 'remove_all', 'sync' and 'run'.
+        
+        remove_all  - remove all service records point to this host
+        sync        - synchronise the service records with the running containers
+        run         - continuously update the SRV records by subscribing to the Docker event stream
+        
     """
     def __init__(self, dns_name, hosted_zone_id, hostname):
         """
@@ -100,7 +98,6 @@ class ECSServiceRegistrator:
         zones = filter(lambda r: r['Name'] == self.dns_name, response['HostedZones'])
         if len(zones) == 1:
             self.hosted_zone_id = zones[0]['Id'].split('/')[-1]
-            log.warn('found hosted zone id %s for dns name %s' % (self.hosted_zone_id, self.dns_name))
         elif len(zones) > 1:
             raise click.UsageError('There are %d hosted zones for the DNS name %s, please specify --hosted-zone-id' % (len(zones), self.dns_name))
         else:
@@ -114,6 +111,7 @@ class ECSServiceRegistrator:
 
     def get_environment_of_container(self, container):
         """
+        returns the environment variables of the container as a dictionary.
         require:
             container is not None
             attrs in container 
@@ -142,15 +140,23 @@ class ECSServiceRegistrator:
         """
         return rr['Type'] == 'SRV' and 'SetIdentifier' in rr and rr['SetIdentifier'].startswith('%s:' % self.hostname)
 
-    def load_hosted_zone(self):
+    def load_service_records(self):
+        """
+        loads all SRV records from the hosted zone that are managed by this registrator.
+        ensure:
+            len(filter(lambda r: self.is_managed_resource_record_set(r), self.srv_records) == len(self.srv_records)
+        """
         self.srv_records = []
         paginator = self.route53.get_paginator('list_resource_record_sets')
         page_iterator = paginator.paginate(HostedZoneId=self.hosted_zone_id)
         for page in page_iterator:
-            self.srv_records.extend(filter(
-                lambda rr: self.is_managed_resource_record_set(rr), page['ResourceRecordSets']))
+            records = filter(lambda rr: self.is_managed_resource_record_set(rr), page['ResourceRecordSets'])
+            self.srv_records.extend(records)
 
     def create_service_record(self, container_id, port, name):
+        """
+        create a SRV record for the specified container id, port and name.
+        """
         return {
             "Name": "%s.%s" % (name, self.dns_name),
             "Weight": 1,
@@ -164,18 +170,25 @@ class ECSServiceRegistrator:
             "SetIdentifier": "%s:%s" % (self.hostname, container_id)
         }
 
-    def register_service(self, service_records):
+    def save_service_records(self, service_records):
+        """
+        Create or update all 'service_records' in the hosted zone. On succesfull completion, the
+        self.srv_records is updated with the new records.
+        """
         try:
             batch = {"Changes": [
                 {"Action": "UPSERT", "ResourceRecordSet": r} for r in service_records]}
             self.route53.change_resource_record_sets(
                 HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
             for r in service_records:
-                self.update_srv_record(r)
+                self.update_srv_records(r)
         except ClientError as e:
             log.error('could not add SRV records, %s' % (container_id, e))
 
-    def update_srv_record(self, record):
+    def update_srv_records(self, record):
+        """
+        updates 'self.srv_records' with the new 'record'. If it did not exist, it is added.
+        """
         for i, rr in enumerate(self.srv_records):
             if rr['SetIdentifier'] == record['SetIdentifier'] and rr['Name'] == record['Name']:
                 self.srv_records[i] = record
@@ -183,10 +196,24 @@ class ECSServiceRegistrator:
         self.srv_records.append(record)
 
     def find_srv_records(self, container_id):
+        """
+        returns all service records in 'self.srv_records' belonging to the specified container.
+        """
         set_id = '%s:%s' % (self.hostname, container_id)
         return filter(lambda rr: rr['SetIdentifier'] == set_id, self.srv_records)
 
-    def deregister_service(self, container_id):
+    def remove_srv_records_by_container_id(self, container_id):
+        """
+        removes all service records from 'self.srv_records' for the specified container.
+        """
+        set_id = '%s:%s' % (self.hostname, container_id)
+        self.srv_records = filter(lambda r: r['SetIdentifier'] != set_id, self.srv_records)
+
+    def deregister_container(self, container_id):
+        """
+        remove all service records from the hosted zone associated with the specified container. updates
+        'self.srv_records' on success.
+        """
         records = self.find_srv_records(container_id)
         if len(records) > 0:
             log.info('deregistering %d SRV records for container %s' %
@@ -197,6 +224,8 @@ class ECSServiceRegistrator:
                     {"Action": "DELETE", "ResourceRecordSet": rr} for rr in records]}
                 self.route53.change_resource_record_sets(
                     HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
+                self.remove_srv_records_by_container_id(container_id)
+
             except ClientError as e:
                 log.error('could not remove %d SRV records for container %s, %s' %
                           (len(records), container_id, e))
@@ -205,6 +234,12 @@ class ECSServiceRegistrator:
                       container_id)
 
     def create_service_records(self, container):
+        """
+        creates a service record for each exposed port of the specified container
+        that has a matching environment variable 'SERVICE_<port>_NAME'.
+        If a single port is exposed, a matching SERVICE_NAME suffices.
+
+        """
         result = []
         env = self.get_environment_of_container(container)
         ports = container.attrs['NetworkSettings']['Ports']
@@ -228,25 +263,31 @@ class ECSServiceRegistrator:
         return result
 
     def container_started(self, container_id, event):
+        """
+        create a service record for all exposed services of the specified container.
+        """
         try:
             container = self.dockr.containers.get(container_id)
             service_records = self.create_service_records(container)
             if len(service_records) > 0:
                 log.info('registering %d SRV record for container %s' %
                          (len(service_records), container_id))
-                self.register_service(service_records)
+                self.save_service_records(service_records)
 
         except docker.errors.NotFound as e:
             log.error('container %s does not exist.' % container_id)
 
     def container_died(self, container_id, event):
-        self.deregister_service(container_id)
+        """
+        remove all service records associated with the specified container.
+        """
+        self.deregister_container(container_id)
 
     def deregister_orphaned_records(self, records):
+        """
+        deletes all the specified service records from the hosted zone. Updates 'self.srv_records' accordingly.
+        """
         if len(records) > 0:
-            log.info('deregistering srv records %s' % (
-                ' '.join(map(lambda r: r['Name'], records))))
-
             try:
                 batch = {"Changes": [
                     {"Action": "DELETE", "ResourceRecordSet": rr} for rr in records]}
@@ -260,6 +301,9 @@ class ECSServiceRegistrator:
                 log.error('could not remove %d SRV records, %s' % (len(records), e))
 
     def register_running_containers(self, containers):
+        """
+        create SRV records for all running containers. Updates 'self.srv_records' accordingly.
+        """
         records = []
         for c in containers:
             records.extend(self.create_service_records(c))
@@ -280,7 +324,12 @@ class ECSServiceRegistrator:
                           (len(records), e))
 
     def sync(self):
-        self.load_hosted_zone()
+        """
+        synchronizes the service records of the hosted zone against the currently running docker instances.
+        SRV records associated with containers on this host which are no longer running, will be removed.
+        Missing SRV records from running containers are added.
+        """
+        self.load_service_records()
         containers = self.dockr.containers.list()
         in_zone = set(map(lambda rr: rr['SetIdentifier'], self.srv_records))
         running = set(map(lambda c: '%s:%s' %
@@ -289,18 +338,29 @@ class ECSServiceRegistrator:
         to_add = running - in_zone
 
         if len(to_delete) > 0 or len(to_add) > 0:
-            log.info('zone for host %s out of sync, adding %d and removing %d records' % (
-                self.hostname, len(to_add), len(to_delete)))
+            log.info('zone "%s" for host %s out of sync, adding %d and removing %d records' % (
+                self.dns_name, self.hostname, len(to_add), len(to_delete)))
             records = filter(lambda r: r['SetIdentifier'] in to_delete, self.srv_records)
             self.deregister_orphaned_records(records)
 
             containers = filter(lambda c: '%s:%s' % (self.hostname, c.attrs['Id']) in to_add, containers)
             self.register_running_containers(containers)
         else:
-            log.info('zone for host %s in sync', self.hostname)
+            log.info('zone "%s" for host %s in sync, %d records found for %d running containers' % (self.dns_name, self.hostname, len(in_zone), len(running)))
+
+    def remove_all(self):
+        """
+        remove all SRV records from the hosted zone associated with this host. Run this on the shutdown
+        event of the host.
+        """
+        self.load_service_records()
+        self.deregister_orphaned_records(self.srv_records)
 
     def process_events(self):
-        self.load_hosted_zone()
+        """
+        Process docker container start and die events.
+        """
+        self.load_service_records()
         log.info('found %d SRV records for host %s' %
                  (len(self.srv_records), self.hostname))
         for e in self.dockr.events():
@@ -317,9 +377,6 @@ class ECSServiceRegistrator:
                 else:
                     pass  # boring...
 
-    def remove_all(self):
-        self.load_hosted_zone()
-        self.deregister_orphaned_records(self.srv_records)
     
 @click.group()
 @click.option('--dns-name', required=False, help='to synchronize the SRV records with.')
@@ -338,6 +395,9 @@ def cli(ctx, dns_name, hosted_zone_id, hostname):
 @cli.command()
 @click.pass_context
 def run(ctx):
+    """
+    process docker container 'start' and 'die' events to add and delete SRV records accordingly.
+    """
     e = ECSServiceRegistrator(ctx.obj['dns_name'], ctx.obj[
                               'hosted_zone_id'], ctx.obj['hostname'])
     e.sync()
@@ -346,6 +406,9 @@ def run(ctx):
 @cli.command()
 @click.pass_context
 def remove_all(ctx):
+    """
+    remove all SRV records associated with this host.
+    """
     e = ECSServiceRegistrator(ctx.obj['dns_name'], ctx.obj[
                               'hosted_zone_id'], ctx.obj['hostname'])
     e.remove_all()
@@ -353,6 +416,9 @@ def remove_all(ctx):
 @cli.command()
 @click.pass_context
 def sync(ctx):
+    """
+    Synchronize the SRV records with the current docker containers.
+    """
     e = ECSServiceRegistrator(ctx.obj['dns_name'], ctx.obj[
                               'hosted_zone_id'], ctx.obj['hostname'])
     e.sync()
