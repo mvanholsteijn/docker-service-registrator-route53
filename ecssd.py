@@ -1,3 +1,4 @@
+#!/usr/bin/env python 
 import sys
 import json
 import logging
@@ -25,11 +26,11 @@ class ECSServiceRegistrator:
     as set identifier. This allows the registrator to synchronise SRV records with
     the current state of the running instances on the host. 
 
-    The registrator has three commands: 'remove_all', 'sync' and 'run'.
+    The registrator has three commands: 'remove_all', 'sync' and 'daemon'.
         
         remove_all  - remove all service records point to this host
         sync        - synchronise the service records with the running containers
-        run         - continuously update the SRV records by subscribing to the Docker event stream
+        daemon         - continuously update the SRV records by subscribing to the Docker event stream
         
     """
     def __init__(self, dns_name, hosted_zone_id, hostname):
@@ -385,7 +386,7 @@ class ECSServiceRegistrator:
 @click.pass_context
 def cli(ctx, dns_name, hosted_zone_id, hostname):
     if dns_name is None and hosted_zone_id is None:
-        click.echo('either --dns-name or --hosted-zone-id has to be spcified.')
+        click.echo('either --dns-name or --hosted-zone-id has to be specified.')
         sys.exit(1)
     ctx.obj['dns_name'] = dns_name
     ctx.obj['hosted_zone_id'] = hosted_zone_id
@@ -394,7 +395,7 @@ def cli(ctx, dns_name, hosted_zone_id, hostname):
 
 @cli.command()
 @click.pass_context
-def run(ctx):
+def daemon(ctx):
     """
     process docker container 'start' and 'die' events to add and delete SRV records accordingly.
     """
