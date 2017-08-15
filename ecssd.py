@@ -12,56 +12,109 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('ECSServiceRegistrator')
 log.setLevel('INFO')
 
-
-class ECSServiceRegistrator:
-    """
-    manages the SRV record registration in Route53 for Docker containers running on this host.
-
-    When a container is start, the registrator will create a SRV record for each
-    exposed port which has a matching SERVICE_<exposed-port>_NAME environment
-    variable. If the container exposes a single port, it suffices to have a SERVICE_NAME
-    environment variable.
-
-    The registrator will create SRV records in Route53 with '<hostname>:<container-id>'
-    as set identifier. This allows the registrator to synchronise SRV records with
-    the current state of the running instances on the host. 
-
-    The registrator has three commands: 'remove_all', 'sync' and 'daemon'.
-        
-        remove_all  - remove all service records point to this host
-        sync        - synchronise the service records with the running containers
-        daemon         - continuously update the SRV records by subscribing to the Docker event stream
-        
-    """
-    def __init__(self, dns_name, hosted_zone_id, hostname):
-        """
-        constructor. determines the Route53 hosted zone by either the dns_name or the hosted_zone_id.
-        requires:
-        - hostname is not None
-        - valid hosted_zone_id is hosted_zone_id is not None
-        - dns_name exists in Route53
-        ensures:
-        - self.dns_name == dns_name if dns_name is not None and hosted_zone_id is None 
-        - self.hosted_zone_id == hosted_zone_id if hosted_zone_id is not None
-        - self.hostname == hostname
-        """
+class Route53Cache:
+    def __init__(self, dns_name, hostname, hosted_zone_id):
         assert hostname is not None
-        assert hosted_zone_id is not None or dns_name is not None
-
-        self.dockr = docker.from_env()
         self.route53 = boto3.client('route53')
 
+        self.dns_name = dns_name
         self.hostname = hostname
+        self.hosted_zone_id = hosted_zone_id
 
         if hosted_zone_id is not None:
             self.get_dns_name_for_hosted_zone_id(hosted_zone_id)
         else:
             self.get_hosted_zone_id_for_dns_name(dns_name)
-        
-        assert self.hostname is not None
-        assert self.dns_name is not None
-        assert self.hosted_zone_id is not None
 
+        self.srv_records = []
+        self.load()
+
+    def is_managed_resource_record_set(self, rr):
+        """
+        returns true if the resource record is a SRV record with the  SetIdentifier starting with 'self.hostname':
+
+        require:
+            rr is not None
+            'Type' in rr
+            'SetIdentifier' in rr
+        ensure:
+            result == (rr['Type'] == 'SRV' and rr['SetIdentifier'].startswith('%s:' % self.hostname)
+        """
+        return rr['Type'] == 'SRV' and 'SetIdentifier' in rr and rr['SetIdentifier'].startswith('%s:' % self.hostname)
+
+    def load(self):
+        """
+        loads all SRV records from the hosted zone that are managed by this cache.
+        """
+        self.srv_records = []
+        paginator = self.route53.get_paginator('list_resource_record_sets')
+        page_iterator = paginator.paginate(HostedZoneId=self.hosted_zone_id)
+        for page in page_iterator:
+            records = filter(lambda rr: self.is_managed_resource_record_set(rr), page['ResourceRecordSets'])
+            self.srv_records.extend(records)
+
+        assert len(filter(lambda r: self.is_managed_resource_record_set(r), self.srv_records)) == len(self.srv_records)
+       
+    def add(self, service_records):
+        """
+        Adds or update all 'service_records' in the hosted zone. On succesfull completion, the
+        cache is  updated with the new records.
+        """
+        assert len(filter(lambda r: self.is_managed_resource_record_set(r), service_records)) == len(service_records)
+
+        try:
+            batch = {"Changes": [
+                {"Action": "UPSERT", "ResourceRecordSet": r} for r in service_records]}
+            self.route53.change_resource_record_sets(
+                HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
+            for record in service_records:
+                self._update_cache(record)
+        except ClientError as e:
+            log.error('could not add SRV records, %s' % (container_id, e))
+
+    def get_all(self):
+        result = []
+        result.extend(self.srv_records)
+        return result
+
+    def remove(self, service_records):
+        """
+        deletes all the specified service records from the hosted zone. Updates 'self.srv_records' accordingly.
+        """
+        assert len(filter(lambda r: self.is_managed_resource_record_set(r), service_records)) == len(service_records)
+
+        if len(service_records) > 0:
+            try:
+                batch = {"Changes": [
+                    {"Action": "DELETE", "ResourceRecordSet": rr} for rr in service_records]}
+                self.route53.change_resource_record_sets(
+                    HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
+                set_ids = set(map(lambda r: r['SetIdentifier'], service_records))
+                self.srv_records = filter(
+                    lambda r: r['SetIdentifier'] not in set_ids, self.srv_records)
+
+            except ClientError as e:
+                log.error('could not remove %d SRV records, %s' % (len(records), e))
+
+
+    def _update_cache(self, service_record):
+        """
+        updates 'self.srv_records' with the new 'record'. If it did not exist, it is added.
+        """
+        assert self.is_managed_resource_record_set(service_record)
+
+        for i, rr in enumerate(self.srv_records):
+            if rr['SetIdentifier'] == service_record['SetIdentifier'] and rr['Name'] == service_record['Name']:
+                self.srv_records[i] = service_record
+                return
+        self.srv_records.append(service_record)
+
+    def find_service_records_by_set_identifier(self, set_identifier):
+        """
+        returns all service records in 'self.srv_records' belonging to the specified container.
+        """
+        assert set_identifier is not None
+        return filter(lambda rr: rr['SetIdentifier'] == set_identifier, self.srv_records)
 
     def get_dns_name_for_hosted_zone_id(self, hosted_zone_id):
         """
@@ -110,49 +163,64 @@ class ECSServiceRegistrator:
         log.info('found dns name %s for hosted zone id %s' %
                  (self.dns_name, self.hosted_zone_id))
 
+
+class ECSServiceRegistrator:
+    """
+    manages the SRV record registration in Route53 for Docker containers running on this host.
+
+    When a container is start, the registrator will create a SRV record for each
+    exposed port which has a matching SERVICE_<exposed-port>_NAME environment
+    variable. If the container exposes a single port, it suffices to have a SERVICE_NAME
+    environment variable.
+
+    The registrator will create SRV records in Route53 with '<hostname>:<container-id>'
+    as set identifier. This allows the registrator to synchronise SRV records with
+    the current state of the running instances on the host. 
+
+    The registrator has three commands: 'remove_all', 'sync' and 'daemon'.
+        
+        remove_all  - remove all service records point to this host
+        sync        - synchronise the service records with the running containers
+        daemon      - continuously update the SRV records by subscribing to the Docker event stream
+        
+    """
+    def __init__(self, dns_name, hosted_zone_id, hostname):
+        """
+        constructor. determines the Route53 hosted zone by either the dns_name or the hosted_zone_id.
+        """
+        assert hostname is not None
+        assert hosted_zone_id is not None or dns_name is not None
+
+        self.dockr = docker.from_env()
+        self.hostname = hostname
+        self.cache = Route53Cache(dns_name, hostname, hosted_zone_id)
+        
+        assert self.hostname == hostname        
+
+    @property
+    def dns_name(self):
+        return self.cache.dns_name
+
+    @property
+    def hosted_zone_id(self):
+        return self.cache.hosted_zone_id
+
+
     def get_environment_of_container(self, container):
         """
         returns the environment variables of the container as a dictionary.
-        require:
-            container is not None
-            attrs in container 
-            'Config' in container.attrs
-            'Env' in container.attrs['Config']['Env']
-        ensure:
-            isinstance(result, dict)
-            len(dict) == len(container.attrs['Config']['Env'])
         """
+        assert container is not None
+
         result = {}
         env = container.attrs['Config']['Env']
         for e in env:
             parameter = e.split('=', 1)
             result[parameter[0]] = parameter[1]
+
+        assert len(env) == len(container.attrs['Config']['Env'])
+
         return result
-
-    def is_managed_resource_record_set(self, rr):
-        """
-        returns true if the resource record is managed by this hostname.
-        require:
-            rr is not None
-            'Type' in rr
-            'SetIdentifier' in rr
-        ensure:
-            result == (rr['Type'] == 'SRV' and rr['SetIdentifier'].startswith('%s:' % self.hostname)
-        """
-        return rr['Type'] == 'SRV' and 'SetIdentifier' in rr and rr['SetIdentifier'].startswith('%s:' % self.hostname)
-
-    def load_service_records(self):
-        """
-        loads all SRV records from the hosted zone that are managed by this registrator.
-        ensure:
-            len(filter(lambda r: self.is_managed_resource_record_set(r), self.srv_records) == len(self.srv_records)
-        """
-        self.srv_records = []
-        paginator = self.route53.get_paginator('list_resource_record_sets')
-        page_iterator = paginator.paginate(HostedZoneId=self.hosted_zone_id)
-        for page in page_iterator:
-            records = filter(lambda rr: self.is_managed_resource_record_set(rr), page['ResourceRecordSets'])
-            self.srv_records.extend(records)
 
     def create_service_record(self, container_id, port, name):
         """
@@ -170,69 +238,6 @@ class ECSServiceRegistrator:
             "TTL": 0,
             "SetIdentifier": "%s:%s" % (self.hostname, container_id)
         }
-
-    def save_service_records(self, service_records):
-        """
-        Create or update all 'service_records' in the hosted zone. On succesfull completion, the
-        self.srv_records is updated with the new records.
-        """
-        try:
-            batch = {"Changes": [
-                {"Action": "UPSERT", "ResourceRecordSet": r} for r in service_records]}
-            self.route53.change_resource_record_sets(
-                HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
-            for r in service_records:
-                self.update_srv_records(r)
-        except ClientError as e:
-            log.error('could not add SRV records, %s' % (container_id, e))
-
-    def update_srv_records(self, record):
-        """
-        updates 'self.srv_records' with the new 'record'. If it did not exist, it is added.
-        """
-        for i, rr in enumerate(self.srv_records):
-            if rr['SetIdentifier'] == record['SetIdentifier'] and rr['Name'] == record['Name']:
-                self.srv_records[i] = record
-                return
-        self.srv_records.append(record)
-
-    def find_srv_records(self, container_id):
-        """
-        returns all service records in 'self.srv_records' belonging to the specified container.
-        """
-        set_id = '%s:%s' % (self.hostname, container_id)
-        return filter(lambda rr: rr['SetIdentifier'] == set_id, self.srv_records)
-
-    def remove_srv_records_by_container_id(self, container_id):
-        """
-        removes all service records from 'self.srv_records' for the specified container.
-        """
-        set_id = '%s:%s' % (self.hostname, container_id)
-        self.srv_records = filter(lambda r: r['SetIdentifier'] != set_id, self.srv_records)
-
-    def deregister_container(self, container_id):
-        """
-        remove all service records from the hosted zone associated with the specified container. updates
-        'self.srv_records' on success.
-        """
-        records = self.find_srv_records(container_id)
-        if len(records) > 0:
-            log.info('deregistering %d SRV records for container %s' %
-                     (len(records), container_id))
-
-            try:
-                batch = {"Changes": [
-                    {"Action": "DELETE", "ResourceRecordSet": rr} for rr in records]}
-                self.route53.change_resource_record_sets(
-                    HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
-                self.remove_srv_records_by_container_id(container_id)
-
-            except ClientError as e:
-                log.error('could not remove %d SRV records for container %s, %s' %
-                          (len(records), container_id, e))
-        else:
-            log.debug('No SRV record found for container with id %s' %
-                      container_id)
 
     def create_service_records(self, container):
         """
@@ -273,7 +278,7 @@ class ECSServiceRegistrator:
             if len(service_records) > 0:
                 log.info('registering %d SRV record for container %s' %
                          (len(service_records), container_id))
-                self.save_service_records(service_records)
+                self.cache.add(service_records)
 
         except docker.errors.NotFound as e:
             log.error('container %s does not exist.' % container_id)
@@ -282,47 +287,15 @@ class ECSServiceRegistrator:
         """
         remove all service records associated with the specified container.
         """
-        self.deregister_container(container_id)
-
-    def deregister_orphaned_records(self, records):
-        """
-        deletes all the specified service records from the hosted zone. Updates 'self.srv_records' accordingly.
-        """
+        set_identifier = '%s:%s' % (self.hostname, container_id)
+        records =  self.cache.find_service_records_by_set_identifier(set_identifier)
         if len(records) > 0:
-            try:
-                batch = {"Changes": [
-                    {"Action": "DELETE", "ResourceRecordSet": rr} for rr in records]}
-                self.route53.change_resource_record_sets(
-                    HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
-                set_ids = set(map(lambda r: r['SetIdentifier'], records))
-                self.srv_records = filter(
-                    lambda r: r['SetIdentifier'] not in set_ids, self.srv_records)
-
-            except ClientError as e:
-                log.error('could not remove %d SRV records, %s' % (len(records), e))
-
-    def register_running_containers(self, containers):
-        """
-        create SRV records for all running containers. Updates 'self.srv_records' accordingly.
-        """
-        records = []
-        for c in containers:
-            records.extend(self.create_service_records(c))
-
-        if len(records) > 0:
-            log.info('registering srv records %s' % (
-                ' '.join(map(lambda r: r['Name'], records))))
-
-            try:
-                batch = {"Changes": [
-                    {"Action": "UPSERT", "ResourceRecordSet": rr} for rr in records]}
-                self.route53.change_resource_record_sets(
-                    HostedZoneId=self.hosted_zone_id, ChangeBatch=batch)
-                self.srv_records.extend(records)
-
-            except ClientError as e:
-                log.error('could not add %d SRV records, %s' %
-                          (len(records), e))
+            log.info('deregistering %d SRV records for container %s' %
+                     (len(records), container_id))
+            self.cache.remove(records)
+        else:
+            log.debug('No SRV record found for container with id %s' %
+                      container_id)
 
     def sync(self):
         """
@@ -330,40 +303,48 @@ class ECSServiceRegistrator:
         SRV records associated with containers on this host which are no longer running, will be removed.
         Missing SRV records from running containers are added.
         """
-        self.load_service_records()
         containers = self.dockr.containers.list()
-        in_zone = set(map(lambda rr: rr['SetIdentifier'], self.srv_records))
-        running = set(map(lambda c: '%s:%s' %
-                          (self.hostname, c.attrs['Id']), containers))
+        in_zone = set(map(lambda rr: rr['SetIdentifier'], self.cache.get_all()))
+        running = set(map(lambda c: '%s:%s' % (self.hostname, c.attrs['Id']), containers))
         to_delete = in_zone - running
         to_add = running - in_zone
 
         if len(to_delete) > 0 or len(to_add) > 0:
             log.info('zone "%s" for host %s out of sync, adding %d and removing %d records' % (
                 self.dns_name, self.hostname, len(to_add), len(to_delete)))
-            records = filter(lambda r: r['SetIdentifier'] in to_delete, self.srv_records)
-            self.deregister_orphaned_records(records)
-
-            containers = filter(lambda c: '%s:%s' % (self.hostname, c.attrs['Id']) in to_add, containers)
-            self.register_running_containers(containers)
-        else:
+        else:        
             log.info('zone "%s" for host %s in sync, %d records found for %d running containers' % (self.dns_name, self.hostname, len(in_zone), len(running)))
+
+        if len(to_delete) > 0:
+            records = filter(lambda r: r['SetIdentifier'] in to_delete, self.cache.get_all())
+	    for r in records:
+		log.info('removing SRV record %s %s' % (r['Name'], r['ResourceRecords'][0]['Value']))
+            self.cache.remove(records)
+
+        if len(to_add) > 0:
+            containers = filter(lambda c: '%s:%s' % (self.hostname, c.attrs['Id']) in to_add, containers)
+            records = []
+            for c in containers:
+                records.extend(self.create_service_records(c))
+
+            if len(records) > 0:
+                for r in records:
+                    log.info('adding SRV record %s %s' % (r['Name'], r['ResourceRecords'][0]['Value']))
+                self.cache.add(records)
 
     def remove_all(self):
         """
         remove all SRV records from the hosted zone associated with this host. Run this on the shutdown
         event of the host.
         """
-        self.load_service_records()
-        self.deregister_orphaned_records(self.srv_records)
+        self.cache.remove(self.cache.get_all())
 
     def process_events(self):
         """
         Process docker container start and die events.
         """
-        self.load_service_records()
         log.info('found %d SRV records for host %s' %
-                 (len(self.srv_records), self.hostname))
+                 (len(self.cache.get_all()), self.hostname))
         for e in self.dockr.events():
             lines = filter(lambda l: len(l) > 0, e.split('\n'))
             for line in lines:
