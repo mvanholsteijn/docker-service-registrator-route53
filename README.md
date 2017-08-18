@@ -1,5 +1,5 @@
-# ECS Docker instance to Route53 SRV record synchronization daemon
-
+# Docker instance to Route53 SRV record synchronization daemon
+ 
 manages the SRV record registration in Route53 for Docker containers running on this host.
 
 When a container is start, the registrator will create a SRV record for each
