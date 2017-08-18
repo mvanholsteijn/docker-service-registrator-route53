@@ -13,8 +13,23 @@ the current state of the running instances on the host.
 
 The registrator has three commands: remove\_all, sync and daemon.
 
+## Daemon mode
+When the registrator starts in daemon mode it will first do a full sync, to ensure that
+the SRV records in the zone are actually reflecting docker instances running on this host.
+
+After that, it will process Docker container start and die events to update the zone.
+
+## Sync
+You can run a standalone sync command to ensure that the SRV records in the zone are 
+actually reflecting docker instances running on this host. 
+
+## Remove all
+When the host is shutdown, it is wise to run the remove\_all command to remove all SRV
+records pointing to this host.
+
+
 ```
-remove\_all - remove all service records point to this host, but run on host shutdown
+remove_all  - remove all service records point to this host, but run on host shutdown
 sync        - synchronise the service records with the running containers 
 daemon      - continuously update the SRV records by subscribing to the Docker event stream
 ```
