@@ -1,4 +1,4 @@
-# Docker instance to Route53 SRV record synchronization daemon
+# Docker service registrator for Route53 
  
 manages the SRV record registration in Route53 for Docker containers running on this host.
 
