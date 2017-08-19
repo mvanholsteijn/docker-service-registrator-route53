@@ -1,3 +1,3 @@
 include Makefile.mk
 USERNAME=mvanholsteijn
-NAME=ecssd_agent
+NAME=docker-service-registrator-route53
